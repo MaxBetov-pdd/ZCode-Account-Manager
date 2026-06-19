@@ -29,9 +29,16 @@ import uuid
 import logging
 import traceback
 import datetime
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
+
+# Логика опроса реальных лимитов (официальный billing API zcode.z.ai)
+try:
+    import billing as billing_mod
+except Exception:
+    billing_mod = None
 
 # --- логирование в файл (видно даже под pythonw) ------------------------
 _log_path = Path(__file__).resolve().parent / "data" / "app.log"
@@ -124,6 +131,13 @@ START_PLAN_KEY = "builtin:zai-start-plan"
 LIMIT_RESET_HOUR = 19
 # Интервал автообновления статуса (мс).
 AUTO_REFRESH_MS = 5000
+# Интервал опроса РЕАЛЬНЫХ лимитов через billing API (мс). Реже, чем статус,
+# чтобы не спамить API. ~2 минуты.
+BILLING_REFRESH_MS = 120000
+# Порог «почти исчерпан» в процентах: ниже этого строка краснеет.
+EXHAUST_THRESHOLD_PCT = 5
+# Модель, по которой считаем «исчерпан ли лимит» (GLM-5.2 — основная).
+LIMIT_MODEL = "GLM-5.2"
 
 for _d in (DATA_DIR, PROFILES_DIR, BACKUPS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -260,6 +274,17 @@ def limit_label(info):
     if st == "exhausted":
         return "🔴"
     return "—"
+
+
+def fmt_remaining(n):
+    """Красивое число токенов: 0 -> '0', 86544 -> '86.5k', 3000000 -> '3.00M'."""
+    if not n or n <= 0:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
 
 
 # --- профили -------------------------------------------------------------
@@ -441,17 +466,25 @@ class App(tk.Tk):
         super().__init__()
         log.info("App GUI initializing")
         self.title("ZCode Account Manager")
-        self.geometry("820x540")
-        self.minsize(760, 480)
+        self.geometry("880x540")
+        self.minsize(820, 480)
 
         self.store = load_store()
         log.info("loaded store: %d profiles", len(self.store["profiles"]))
         self.selected_pid = tk.StringVar()
 
+        # Кэш РЕАЛЬНЫХ лимитов из billing API: {user_id: {model_name: summary_model}}
+        # Заполняется в фоне; None = ещё не опрошено, {} = ошибка.
+        self.live_limits = {}
+        self._billing_lock = threading.Lock()
+        self._billing_in_progress = False
+
         self._build_ui()
         self.refresh()
         # запускаем автообновление статуса (без перезапуска менеджера)
         self.after(AUTO_REFRESH_MS, self._auto_refresh)
+        # запускаем фоновый опрос реальных лимитов (отложенно)
+        self.after(2000, self._refresh_billing_tick)
         log.info("App GUI ready")
 
     # --- построение интерфейса -------------------------------------------
@@ -464,7 +497,7 @@ class App(tk.Tk):
             side="left")
         self.lbl_current = ttk.Label(top, text="…", foreground="#0a7")
         self.lbl_current.pack(side="left", padx=(6, 0))
-        ttk.Label(top, text=f"  (автообновление каждые {AUTO_REFRESH_MS // 1000}с)",
+        ttk.Label(top, text="  (статус 5с · лимиты реальные)",
                   foreground="gray").pack(side="left")
         ttk.Button(top, text="Обновить", command=self.refresh).pack(side="right")
 
@@ -479,27 +512,26 @@ class App(tk.Tk):
         cols = ("name", "limit", "sub", "uid")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=12)
         self.tree.heading("name", text="Название")
-        self.tree.heading("limit", text="Лимит")
+        self.tree.heading("limit", text="Остаток")
         self.tree.heading("sub", text="Подписка")
         self.tree.heading("uid", text="ID аккаунта")
-        self.tree.column("name", width=200, anchor="w")
-        self.tree.column("limit", width=70, anchor="center")
+        self.tree.column("name", width=190, anchor="w")
+        self.tree.column("limit", width=90, anchor="center")
         self.tree.column("sub", width=120, anchor="center")
-        self.tree.column("uid", width=170, anchor="w")
+        self.tree.column("uid", width=160, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
 
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
 
-        # подсветка строк
+        # подсветка строк: ЦВЕТ СТРОКИ ЗАВИСИТ ТОЛЬКО ОТ ЛИМИТА.
+        # Статус подписки отображается текстом в колонке «Подписка» и НЕ красит строку.
+        self.tree.tag_configure("exhausted", foreground="#c33",
+                                font=("Segoe UI", 9, "bold"))
         self.tree.tag_configure("active", foreground="#0a7",
                                 font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("expired", foreground="#c33",
-                                font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("warn", foreground="#c80")
-        self.tree.tag_configure("soon", foreground="#980")
-        self.tree.tag_configure("exhausted", foreground="#c33")
+        self.tree.tag_configure("normal", foreground="#222")  # читаемый тёмный, НЕ серый
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", lambda e: self.switch_selected())
@@ -531,13 +563,22 @@ class App(tk.Tk):
         ttk.Radiobutton(lf, text="🔴 Исчерпан", value="exhausted",
                         variable=self.limit_status).pack(side="left")
 
+        # Реальный остаток из billing API (только показ)
+        ttk.Label(right, text="Остаток (API):").grid(row=3, column=0, sticky="nw", pady=4)
+        self.lbl_real_limit = tk.Text(right, width=26, height=4, relief="flat",
+                                      highlightthickness=0,
+                                      font=("Segoe UI", 9), wrap="word")
+        self.lbl_real_limit.grid(row=3, column=1, columnspan=2, sticky="we",
+                                 pady=4, padx=(8, 0))
+        self.lbl_real_limit.configure(state="disabled")
+
         # Заметки
-        ttk.Label(right, text="Заметки:").grid(row=3, column=0, sticky="nw", pady=4)
+        ttk.Label(right, text="Заметки:").grid(row=4, column=0, sticky="nw", pady=4)
         self.t_notes = tk.Text(right, width=26, height=4)
-        self.t_notes.grid(row=3, column=1, columnspan=2, sticky="we", pady=4, padx=(8, 0))
+        self.t_notes.grid(row=4, column=1, columnspan=2, sticky="we", pady=4, padx=(8, 0))
 
         ttk.Button(right, text="Сохранить детали",
-                   command=self.save_details).grid(row=4, column=0, columnspan=3,
+                   command=self.save_details).grid(row=5, column=0, columnspan=3,
                                                    sticky="we", pady=(8, 0))
 
         # Низ: действия
@@ -604,37 +645,46 @@ class App(tk.Tk):
                 text=f"не сохранён в менеджере   [{uid[:8]}…]", foreground="#a60")
 
     def _tree_rows(self):
-        """Генератор строк дерева: (pid, disp_values, tag)."""
+        """Генератор строк дерева: (pid, disp_values, tag).
+
+        Остаток и цвет строки берутся из РЕАЛЬНЫХ данных billing API.
+        Пока биллинг не ответил — fallback на ручную отметку limit_status.
+        """
         t = now()
         live_uid = get_live_user_id()
         items = sorted(self.store["profiles"].items(),
                        key=lambda kv: kv[1].get("name", "").lower())
         for pid, info in items:
             name = info.get("name", "?")
-            is_active = (info.get("user_id") == live_uid)
+            uid = info.get("user_id") or ""
+            is_active = (uid == live_uid)
 
-            # подписка
+            # подписка (текст в колонке, цвет строки НЕ трогает)
             sub_key, sub_text = subscription_status(info, t)
 
             disp_name = ("● " + name) if is_active else ("  " + name)
 
-            # приоритет тега: истёкшая подписка > истекает сегодня > скоро >
-            #                 исчерпан лимит > активен
-            if sub_key == "expired":
-                tag = "expired"
-            elif sub_key == "expires_today":
-                tag = "warn"
-            elif sub_key == "soon":
-                tag = "soon"
-            elif info.get("limit_status") == "exhausted":
+            # РЕАЛЬНЫЙ лимит из billing API
+            real = self._real_limit_for(uid)
+            if real is not None:
+                # есть данные — цвет и текст по реальному остатку
+                pct = real.get("pct_left", 0)
+                limit_text = fmt_remaining(real.get("remaining", 0))
+                real_exhausted = pct < EXHAUST_THRESHOLD_PCT
+            else:
+                # биллинг ещё не ответил — fallback на ручную отметку
+                limit_text = limit_label(info)
+                real_exhausted = (info.get("limit_status") == "exhausted")
+
+            # ЦВЕТ СТРОКИ зависит ТОЛЬКО от лимита (не от подписки!).
+            if real_exhausted:
                 tag = "exhausted"
             elif is_active:
                 tag = "active"
             else:
-                tag = ""
+                tag = "normal"
 
-            values = (disp_name, limit_label(info), sub_text,
-                      (info.get("user_id") or "")[:18] + "…")
+            values = (disp_name, limit_text, sub_text, uid[:18] + "…")
             yield pid, values, tag
 
     def _refresh_tree(self):
@@ -666,6 +716,7 @@ class App(tk.Tk):
         self.e_expires.delete(0, "end")
         self.limit_status.set("available")
         self.t_notes.delete("1.0", "end")
+        self._load_real_limit(None)  # сброс блока реального остатка
         if not sel:
             return
         pid = sel[0]
@@ -674,11 +725,110 @@ class App(tk.Tk):
         self.e_expires.insert(0, info.get("expires", ""))
         self.limit_status.set(info.get("limit_status") or "available")
         self.t_notes.insert("1.0", info.get("notes", ""))
+        # реальный остаток для этого аккаунта
+        self._load_real_limit(info.get("user_id"))
+
+    def _load_real_limit(self, user_id):
+        """Заполняет блок «Остаток (API)» реальными данными по всем моделям."""
+        widget = self.lbl_real_limit
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        if not user_id:
+            widget.insert("1.0", "—")
+            widget.configure(state="disabled")
+            return
+        models = None
+        with self._billing_lock:
+            cache = self.live_limits.get(user_id)
+            if cache:
+                models = list(cache.values())
+        if not models:
+            widget.insert("1.0", "загрузка… (обновляется в фоне)")
+            widget.configure(state="disabled")
+            return
+        lines = []
+        for m in sorted(models, key=lambda x: -x.get("total", 0)):
+            pct = m.get("pct_left", 0)
+            rem = fmt_remaining(m.get("remaining", 0))
+            tot = fmt_remaining(m.get("total", 0))
+            flag = " 🔴" if m.get("exhausted") else ""
+            lines.append(f"{m.get('name','?')}: {rem} / {tot}  ({pct:.0f}%){flag}")
+        widget.insert("1.0", "\n".join(lines))
+        widget.configure(state="disabled")
 
     # --- действия --------------------------------------------------------
 
     def _status(self, text):
         self.lbl_status.config(text=text)
+
+    # --- реальные лимиты через billing API (в фоне) ----------------------
+
+    def _refresh_billing_tick(self):
+        """Планировщик фонового опроса лимитов. Запускается по таймеру."""
+        if billing_mod is None:
+            return  # модуль биллинга недоступен — тихо работаем в старом режиме
+        # не запускаем новый опрос, если предыдущий ещё идёт
+        if not self._billing_in_progress:
+            self._billing_in_progress = True
+            th = threading.Thread(target=self._billing_worker, daemon=True)
+            th.start()
+        self.after(BILLING_REFRESH_MS, self._refresh_billing_tick)
+
+    def _billing_worker(self):
+        """В фоновом потоке: опрашивает все профили, складывает в кэш,
+        затем просит главный поток перерисовать таблицу."""
+        try:
+            results = billing_mod.summarize_all(include_live=True)
+            new_cache = {}
+            for r in results:
+                s = r.get("summary", {})
+                uid = s.get("user_id")
+                if not uid or not s.get("ok"):
+                    continue
+                # модель -> её сводка
+                models = {m["name"]: m for m in s.get("models", [])}
+                new_cache[uid] = models
+            with self._billing_lock:
+                self.live_limits = new_cache
+            log.info("billing refreshed: %d accounts", len(new_cache))
+        except Exception:
+            log.exception("billing worker failed")
+        finally:
+            self._billing_in_progress = False
+            # перерисовать таблицу в главном потоке
+            try:
+                self.after(0, self._safe_tree_refresh)
+            except Exception:
+                pass
+
+    def _safe_tree_refresh(self):
+        """Перерисовка таблицы + деталей в главном потоке после опроса биллинга."""
+        try:
+            self._refresh_tree_preserve_selection()
+            # обновить блок реального остатка для выбранного аккаунта
+            sel = self.tree.selection()
+            if sel:
+                info = self.store["profiles"].get(sel[0], {})
+                self._load_real_limit(info.get("user_id"))
+        except Exception:
+            log.exception("tree refresh failed")
+
+    def _real_limit_for(self, user_id, model=LIMIT_MODEL):
+        """Возвращает summary-модель (dict) или None для данного аккаунта."""
+        with self._billing_lock:
+            models = self.live_limits.get(user_id)
+        if not models:
+            return None
+        return models.get(model)
+
+    def _real_limit_text(self, user_id):
+        """Текст колонки «Остаток» из РЕАЛЬНЫХ данных, или заглушка."""
+        m = self._real_limit_for(user_id)
+        if m is None:
+            return "…"  # ещё не опрошено / ошибка
+        if m.get("remaining", 0) <= 0:
+            return "0"
+        return fmt_remaining(m["remaining"])
 
     def add_current(self):
         try:
