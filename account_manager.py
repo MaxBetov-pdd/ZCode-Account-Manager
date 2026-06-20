@@ -40,6 +40,22 @@ try:
 except Exception:
     billing_mod = None
 
+# Авторегистрация аккаунтов (TS-сервер + HTTP-клиент)
+try:
+    import autoreg_client
+    from autoreg_client import AutoregServer, AutoregClient, step_label
+except Exception:
+    autoreg_client = None
+    AutoregServer = None
+    AutoregClient = None
+    step_label = lambda s: s  # noqa: E731
+
+# Мост JWT → файлы ZCode (enc:v1: шифрование)
+try:
+    import zcode_encrypt as ze
+except Exception:
+    ze = None
+
 # --- логирование в файл (видно даже под pythonw) ------------------------
 _log_path = Path(__file__).resolve().parent / "data" / "app.log"
 try:
@@ -479,6 +495,17 @@ class App(tk.Tk):
         self._billing_lock = threading.Lock()
         self._billing_in_progress = False
 
+        # Авторегистрация: TS-сервер + фоновые jobs.
+        # autoreg_server — синглтон (поднимается лениво по кнопке).
+        # autoreg_jobs — {job_id: {email, step, status, error}} для отображения.
+        # _autoreg_lock — защита словаря jobs.
+        self.autoreg_server = AutoregServer.get() if AutoregServer else None
+        self.autoreg_jobs = {}
+        self._autoreg_lock = threading.Lock()
+        self._autoreg_servers_started = False
+        # Окно прогресса авторега (Toplevel), если открыто.
+        self.autoreg_progress_win = None
+
         self._build_ui()
         self.refresh()
         # запускаем автообновление статуса (без перезапуска менеджера)
@@ -588,6 +615,8 @@ class App(tk.Tk):
                    command=self.switch_selected).pack(side="left")
         ttk.Button(bot, text="+ Добавить текущий аккаунт",
                    command=self.add_current).pack(side="left", padx=6)
+        ttk.Button(bot, text="🤖 Авторегистрация",
+                   command=self.open_autoreg).pack(side="left", padx=6)
         ttk.Button(bot, text="🗑 Удалить",
                    command=self.delete_selected).pack(side="left")
         ttk.Button(bot, text="▶ Запустить ZCode",
@@ -978,6 +1007,621 @@ class App(tk.Tk):
         kill_zcode()
         launch_zcode()
         self.after(1500, self.refresh)
+
+    # --- авторегистрация (Фаза 3) ----------------------------------------
+
+    def open_autoreg(self):
+        """Открывает диалог запуска авторегистрации нового аккаунта."""
+        if autoreg_client is None:
+            messagebox.showerror(
+                "Авторегистрация",
+                "Модуль авторега недоступен (autoreg_client). "
+                "Проверь: npm install, npx playwright install chromium.")
+            return
+        dlg = AutoregDialog(self)
+        if not dlg.result:
+            return
+        if dlg.result.get("mode") == "batch":
+            self._start_autoreg_batch(dlg.result["items"])
+        else:
+            self._start_autoreg_job(dlg.result)
+
+    def _start_autoreg_job(self, params):
+        """Запускает фоновый pipeline для ОДНОГО аккаунта."""
+        email = params["email"]
+        mail_password = params.get("mail_password")
+        proxy = params.get("proxy", "direct://") or "direct://"
+        name = params.get("name", "").strip() or email.split("@")[0]
+
+        self._open_progress_window()
+
+        def worker():
+            try:
+                self._post_progress("Стартую TS-сервер авторега…", "init")
+                if not self.autoreg_server:
+                    self._post_progress("Модуль авторега недоступен", "error",
+                                        error="autoreg_server is None")
+                    return
+                if not self._autoreg_servers_started:
+                    self.autoreg_server.ensure_started()
+                    self._autoreg_servers_started = True
+                client = AutoregClient(self.autoreg_server)
+                self._run_one_autoreg(client, email, mail_password, proxy, name)
+            except Exception:
+                tb = traceback.format_exc()
+                log.error("autoreg worker failed:\n%s", tb)
+                self._post_progress(f"Сбой авторега:\n{tb.splitlines()[-1]}",
+                                    "error", error=tb)
+            finally:
+                self._autoreg_finished()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_autoreg_batch(self, items, proxy="direct://"):
+        """Запускает ОЧЕРЕДЬ аккаунтов последовательно.
+        items — список dict: {email, mail_password, name(опц.)}.
+        """
+        self._open_progress_window()
+        total = len(items)
+
+        def worker():
+            try:
+                self._post_progress(f"Стартую TS-сервер авторега…", "init")
+                if not self.autoreg_server:
+                    self._post_progress("Модуль авторега недоступен", "error",
+                                        error="autoreg_server is None")
+                    return
+                if not self._autoreg_servers_started:
+                    self.autoreg_server.ensure_started()
+                    self._autoreg_servers_started = True
+                client = AutoregClient(self.autoreg_server)
+
+                ok = 0
+                fail = 0
+                self._post_progress(
+                    f"═══ Очередь: {total} аккаунтов ═══", "info")
+                for i, it in enumerate(items, 1):
+                    email = it["email"]
+                    mail_password = it.get("mail_password")
+                    name = it.get("name") or email.split("@")[0]
+                    # прокси из строки пакета имеет приоритет над общим
+                    line_proxy = it.get("proxy") or proxy
+                    self._post_progress(
+                        f"──── [{i}/{total}] {email} ────", "info")
+                    try:
+                        success = self._run_one_autoreg(
+                            client, email, mail_password, line_proxy, name)
+                        if success:
+                            ok += 1
+                        else:
+                            fail += 1
+                    except Exception as e:
+                        fail += 1
+                        self._post_progress(f"✗ Аккаунт провален: {e}", "error",
+                                            error=str(e))
+                    # пауза между аккаунтами (анти-rate-limit на signup)
+                    if i < total:
+                        self._post_progress("пауза 10 сек перед следующим…", "info")
+                        time.sleep(10)
+
+                self._post_progress(
+                    f"═══ Готово: ✅ {ok} успешно, ✗ {fail} провалено "
+                    f"из {total} ═══", "success" if fail == 0 else "info")
+            except Exception:
+                tb = traceback.format_exc()
+                log.error("autoreg batch worker failed:\n%s", tb)
+                self._post_progress(f"Сбой очереди:\n{tb.splitlines()[-1]}",
+                                    "error", error=tb)
+            finally:
+                self._autoreg_finished()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_one_autoreg(self, client, email, mail_password, proxy, name):
+        """Прогон одного аккаунта через pipeline (create → run → poll → import).
+        Возвращает True при успехе, False при провале. Работает ВНУТРИ фонового потока."""
+        # 1) создать job
+        self._post_progress(f"Создаю задачу для {email}…", "init")
+        try:
+            job = client.create_job(email, mail_password=mail_password, proxy=proxy)
+        except Exception as e:
+            self._post_progress(f"✗ Не удалось создать задачу: {e}", "error",
+                                error=str(e))
+            return False
+        job_id = job.get("id")
+        if not job_id:
+            self._post_progress(f"✗ Не удалось создать задачу: {job}", "error",
+                                error=str(job))
+            return False
+        log.info("autoreg job created: %s (email=%s)", job_id, email)
+        self._post_progress(f"Задача создана (id={job_id}). Запускаю pipeline…",
+                            job.get("step", "created"), job_id=job_id)
+        self._register_job(job_id, email, job.get("step", "created"))
+
+        # 2) запускаем pipeline в ОТДЕЛЬНОМ потоке (чтобы поллить статус)
+        run_result = {"done": False, "step": None, "error": None}
+
+        def run_pipeline():
+            try:
+                result = client.run_full(job_id)
+                run_result["step"] = result.get("step", "unknown")
+                run_result["error"] = result.get("error")
+            except Exception as e:
+                run_result["error"] = str(e)
+                run_result["step"] = "error"
+            finally:
+                run_result["done"] = True
+
+        pipe_th = threading.Thread(target=run_pipeline, daemon=True)
+        pipe_th.start()
+        self._post_progress("▶ Pipeline запущен. Капча → signup → email → OAuth…",
+                            "running", job_id=job_id)
+
+        # 3) поллим статус job
+        seen_log_idx = len(job.get("logs", []))
+        deadline = time.time() + 8 * 60  # 8 мин на аккаунт
+        final_step = None
+        final_error = None
+        last_step_shown = job.get("step", "created")
+
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                j = client.get_job(job_id)
+            except Exception as e:
+                self._post_progress(f"(опрос статуса: {e})", "info", job_id=job_id)
+                continue
+
+            cur_step = j.get("step", "?")
+            logs = j.get("logs", [])
+
+            if len(logs) > seen_log_idx:
+                verbose_on = self._verbose_on()
+                for entry in logs[seen_log_idx:]:
+                    msg = entry.get("message", "")
+                    lvl = entry.get("level", "")
+                    is_heartbeat = lvl == "debug" or "В процессе" in msg
+                    if is_heartbeat and not verbose_on:
+                        continue
+                    prefix = {"warn": "⚠ ", "error": "✗ ",
+                              "success": "✓ "}.get(lvl, "• ")
+                    kind = "error" if lvl == "error" else (
+                        "success" if lvl == "success" else "info")
+                    self._post_progress(f"{prefix}{msg}", kind, job_id=job_id)
+                seen_log_idx = len(logs)
+
+            if cur_step != last_step_shown:
+                last_step_shown = cur_step
+                self._post_progress(f"── шаг: {step_label(cur_step)} ──",
+                                    "info", job_id=job_id)
+                self._register_job(job_id, email, cur_step)
+
+            if cur_step == "error":
+                final_error = j.get("error", cur_step)
+                final_step = cur_step
+                break
+            if cur_step == "done":
+                final_step = cur_step
+                break
+            if run_result["done"] and run_result["step"] == "error":
+                final_error = run_result["error"] or "pipeline failed"
+                final_step = "error"
+                break
+
+        if final_step == "error" or final_error:
+            self._post_progress(f"✗ Ошибка: {final_error}", "error",
+                                job_id=job_id, error=final_error)
+            return False
+        if final_step != "done":
+            self._post_progress(
+                f"⏱ Таймаут: pipeline не завершился (step={last_step_shown})",
+                "error", job_id=job_id, error="timeout")
+            return False
+
+        # 4) получить бандл и импортировать профиль через мост
+        self._post_progress("Получаю токены и собираю профиль ZCode…",
+                            "done", job_id=job_id)
+        try:
+            bundle_resp = client.get_bundle(job_id)
+        except Exception as e:
+            self._post_progress(f"✗ Не удалось получить бандл: {e}", "error",
+                                job_id=job_id, error=str(e))
+            return False
+        bundle = bundle_resp.get("bundle")
+        if not bundle or not bundle.get("zcode_jwt"):
+            self._post_progress("✗ Бандл пуст (нет JWT)", "error",
+                                job_id=job_id, error="no jwt in bundle")
+            return False
+
+        return self._import_bundle_as_profile(bundle, name, email, job_id)
+
+    def _next_autoreg_name(self):
+        """Имя профиля для авторега: «autoreg N», где N — первый свободный.
+        Проверяет существующие имена (case-insensitive) и ищет N+1 если занято."""
+        existing = set()
+        for info in self.store.get("profiles", {}).values():
+            n = (info.get("name") or "").strip().lower()
+            if n:
+                existing.add(n)
+        n = 1
+        while f"autoreg {n}" in existing:
+            n += 1
+        return f"autoreg {n}"
+
+    def _import_bundle_as_profile(self, bundle, name, email, job_id):
+        """Берёт готовый бандл и через мост (ze) собирает профиль менеджера.
+        Возвращает True при успехе, False при провале."""
+        if ze is None:
+            self._post_progress("Мост шифрования недоступен (zcode_encrypt)", "error",
+                                job_id=job_id, error="ze is None")
+            return False
+        # Имя для авторега — всегда «autoreg N» с автоувеличением.
+        # Внешний name (из email) игнорируем — он дублировал бы email.
+        name = self._next_autoreg_name()
+        jwt = bundle["zcode_jwt"]
+        # шаблон config.json — берём от первого существующего профиля (структура провайдеров)
+        config_template = None
+        try:
+            for d in PROFILES_DIR.iterdir():
+                tmpl = d / "config.json"
+                if tmpl.exists():
+                    config_template = tmpl
+                    break
+        except Exception:
+            pass
+
+        pid = uuid.uuid4().hex[:12]
+        d = profile_dir(pid)
+        try:
+            uid = ze.write_profile_files(
+                d,
+                jwt=jwt,
+                oauth_access_token=bundle.get("oauth_access_token"),
+                user_id=bundle.get("user_id"),
+                email=email,
+                name=name,
+                config_template=config_template,
+            )
+        except Exception as e:
+            self._post_progress(f"Ошибка сборки профиля: {e}", "error",
+                                job_id=job_id, error=str(e))
+            return False
+
+        # Подписка ZCode start-plan для авторегов — 4 дня от создания.
+        expires_4d = (now() + datetime.timedelta(days=4)).strftime("%Y-%m-%d")
+        info = {
+            "name": name,
+            "user_id": uid,
+            "created": now().isoformat(timespec="seconds"),
+            "expires": expires_4d,
+            "limit_status": "available",
+            "limit_updated": now().isoformat(timespec="seconds"),
+            "notes": f"autoreg · {email}",
+        }
+        self.store["profiles"][pid] = info
+        save_store(self.store)
+        log.info("autoreg profile imported: pid=%s uid=%s email=%s", pid, uid, email)
+        self._post_progress(
+            f"✅ Аккаунт «{name}» добавлен в менеджер!", "success", job_id=job_id)
+        # перерисовать таблицу в главном потоке
+        self.after(0, self.refresh)
+        return True
+
+    # --- окно прогресса авторега ----------------------------------------
+
+    def _open_progress_window(self):
+        """Создаёт (или обновляет) немодальное окно с логом авторега."""
+        if self.autoreg_progress_win is not None:
+            try:
+                self.autoreg_progress_win.lift()
+                return
+            except Exception:
+                self.autoreg_progress_win = None
+
+        win = tk.Toplevel(self)
+        win.title("Авторегистрация аккаунта")
+        win.geometry("640x420")
+        win.resizable(True, True)
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=(10, 4))
+        ttk.Label(head, text="Процесс авторегистрации:",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        # галочка подробного лога
+        self.autoreg_verbose = tk.BooleanVar(value=True)
+        ttk.Checkbutton(head, text="подробный лог (heartbeat)",
+                        variable=self.autoreg_verbose).pack(side="right")
+
+        self.autoreg_progress_text = tk.Text(win, height=18, wrap="word",
+                                             font=("Consolas", 9), state="disabled")
+        self.autoreg_progress_text.pack(fill="both", expand=True, padx=12, pady=4)
+        sb = ttk.Scrollbar(win, orient="vertical",
+                           command=self.autoreg_progress_text.yview)
+        sb.pack(side="right", fill="y")
+        self.autoreg_progress_text.configure(yscrollcommand=sb.set)
+
+        self.autoreg_progress_status = ttk.Label(win, text="", foreground="gray")
+        self.autoreg_progress_status.pack(fill="x", padx=12, pady=(4, 10))
+
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_progress_window())
+        win.transient(self)
+        self.autoreg_progress_win = win
+
+    def _close_progress_window(self):
+        if self.autoreg_progress_win is not None:
+            try:
+                self.autoreg_progress_win.destroy()
+            except Exception:
+                pass
+            self.autoreg_progress_win = None
+
+    def _verbose_on(self):
+        """Состояние галочки «подробный лог» (потокобезопасное чтение)."""
+        try:
+            return bool(self.autoreg_verbose.get())
+        except Exception:
+            return True
+
+    def _post_progress(self, message, kind="info", job_id=None, error=None):
+        """Пишет строку в окно прогресса и в статусбар (потокобезопасно через after)."""
+        ts = now().strftime("%H:%M:%S")
+        line = f"[{ts}] {message}\n"
+        # self.after(0, ...) — выполнение в главном потоке Tk
+        self.after(0, lambda: self._do_post_progress(line, message, kind))
+
+    def _do_post_progress(self, line, message, kind):
+        # текстовое окно
+        if self.autoreg_progress_win is None:
+            return
+        try:
+            w = self.autoreg_progress_text
+            w.configure(state="normal")
+            w.insert("end", line)
+            # подсветка по типу
+            tag = {"success": "green", "error": "red"}.get(kind, "black")
+            w.tag_add(tag, "end-2l linestart", "end-1l lineend")
+            try:
+                w.tag_config("green", foreground="#0a7")
+                w.tag_config("red", foreground="#c33")
+                w.tag_config("black", foreground="#222")
+            except Exception:
+                pass
+            w.see("end")
+            w.configure(state="disabled")
+        except Exception:
+            pass
+        # статусбар
+        try:
+            color = {"success": "#0a7", "error": "#c33"}.get(kind, "gray")
+            self.autoreg_progress_status.config(text=message, foreground=color)
+            self._status(f"Авторег: {message}")
+        except Exception:
+            pass
+
+    def _register_job(self, job_id, email, step, error=None):
+        with self._autoreg_lock:
+            self.autoreg_jobs[job_id] = {
+                "email": email, "step": step, "error": error,
+            }
+
+    def _autoreg_finished(self):
+        # ничего не закрываем — пользователь сам закроет окно прогресса
+        log.info("autoreg worker thread finished")
+
+
+class AutoregDialog(tk.Toplevel):
+    """Диалог запуска авторегистрации: один аккаунт или пакет (email:password)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Авторегистрация аккаунтов")
+        self.resizable(True, True)
+        self.grab_set()
+        self.result = None
+        self._mode = tk.StringVar(value="single")  # single | batch
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        # --- переключатель режима ---
+        mode_frm = ttk.Frame(frm)
+        mode_frm.pack(fill="x", pady=(0, 8))
+        ttk.Radiobutton(mode_frm, text="Один аккаунт", value="single",
+                        variable=self._mode,
+                        command=self._switch_mode).pack(side="left", padx=(0, 16))
+        ttk.Radiobutton(mode_frm, text="📦 Пакет (email:password по строкам)",
+                        value="batch", variable=self._mode,
+                        command=self._switch_mode).pack(side="left")
+
+        # --- Notebook: контейнер для двух форм ---
+        self.nb = ttk.Notebook(frm)
+        self.nb.pack(fill="both", expand=True)
+
+        # вкладка: один аккаунт
+        self.single_frm = ttk.Frame(self.nb, padding=6)
+        self.nb.add(self.single_frm, text="Один")
+        self._build_single(self.single_frm)
+
+        # вкладка: пакет
+        self.batch_frm = ttk.Frame(self.nb, padding=6)
+        self.nb.add(self.batch_frm, text="Пакет")
+        self._build_batch(self.batch_frm)
+
+        # --- общие: прокси ---
+        pf = ttk.LabelFrame(frm, text="Прокси", padding=8)
+        pf.pack(fill="x", pady=(8, 4))
+        self.proxy = tk.StringVar(value="direct://")
+        ttk.Radiobutton(pf, text="Без прокси (direct — с вашего IP)",
+                        value="direct://", variable=self.proxy).pack(anchor="w")
+        cust = ttk.Frame(pf)
+        cust.pack(fill="x", pady=(2, 0))
+        ttk.Radiobutton(cust, text="Свой:", value="custom",
+                        variable=self.proxy).pack(side="left")
+        self.proxy_custom = ttk.Entry(cust, width=40)
+        self.proxy_custom.pack(side="left", padx=(4, 0))
+
+        # пояснение про WAF
+        ttk.Label(frm,
+                  text="⚠ Без residential-прокси Z.AI может заблокировать "
+                       "регистрацию (WAF 405). Капча и OAuth — вероятностны.",
+                  foreground="#a60", wraplength=520, justify="left").pack(
+            anchor="w", pady=(6, 2))
+
+        # --- кнопки ---
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Отмена", command=self._cancel).pack(side="left", padx=6)
+        self.run_btn = ttk.Button(btns, text="🤖 Запустить", command=self._ok)
+        self.run_btn.pack(side="left", padx=6)
+
+        self.transient(parent)
+        self.attributes("-topmost", True)
+        self.after(10, lambda: self.attributes("-topmost", False))
+        self.geometry(f"560x520+{parent.winfo_rootx() + 60}+{parent.winfo_rooty() + 40}")
+        self.focus_force()
+        self.email_entry.focus_set()
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.wait_window()
+
+    # --- построение форм ---
+
+    def _build_single(self, frm):
+        pad = {"padx": 6, "pady": 5}
+        ttk.Label(frm, text="Email (Z.AI + почта): *").grid(
+            row=0, column=0, sticky="w", **pad)
+        self.email = tk.StringVar()
+        self.email_entry = ttk.Entry(frm, textvariable=self.email, width=34)
+        self.email_entry.grid(row=0, column=1, **pad)
+        ttk.Label(frm, text="логин Z.AI = логин IMAP", foreground="gray").grid(
+            row=0, column=2, sticky="w")
+
+        ttk.Label(frm, text="Пароль почты (IMAP): *").grid(
+            row=1, column=0, sticky="w", **pad)
+        self.mail_password = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.mail_password, width=34, show="•").grid(
+            row=1, column=1, **pad)
+        ttk.Label(frm, text="Firstmail и т.п.", foreground="gray").grid(
+            row=1, column=2, sticky="w")
+
+        ttk.Label(frm, text="Название:").grid(row=2, column=0, sticky="w", **pad)
+        self.name = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.name, width=34).grid(row=2, column=1, **pad)
+        ttk.Label(frm, text="как в менеджере", foreground="gray").grid(
+            row=2, column=2, sticky="w")
+
+    def _build_batch(self, frm):
+        ttk.Label(frm,
+                  text="По одной паре на строку. Пароль = пароль от почты (IMAP)."
+                       "\nПароль Z.AI сгенерируется автоматически.\n"
+                   "Поддерживается: email:password  |  email:password|proxy_url",
+                  foreground="gray", justify="left").pack(anchor="w", pady=(0, 4))
+        self.batch_text = tk.Text(frm, width=62, height=14,
+                                  font=("Consolas", 9), wrap="none")
+        self.batch_text.pack(fill="both", expand=True)
+        self.batch_count_lbl = ttk.Label(frm, text="распознано: 0", foreground="gray")
+        self.batch_count_lbl.pack(anchor="w", pady=(4, 0))
+        self.batch_text.bind("<KeyRelease>", self._update_batch_count)
+
+    def _update_batch_count(self, _evt=None):
+        items = self._parse_batch()
+        self.batch_count_lbl.config(
+            text=f"распознано: {len(items)} аккаунт(ов)")
+
+    @staticmethod
+    def _parse_line(line):
+        """Парсит 'email:password' или 'email:password|proxy'."""
+        s = line.strip()
+        if not s or s.startswith("#"):
+            return None
+        proxy = None
+        if "|" in s:
+            left, proxy_part = s.split("|", 1)
+            s = left.strip()
+            proxy = proxy_part.strip() or None
+        if ":" not in s:
+            return None
+        parts = s.split(":", 1)
+        email = parts[0].strip()
+        password = parts[1].strip() if len(parts) > 1 else ""
+        if "@" not in email or not password:
+            return None
+        return {"email": email, "mail_password": password, "proxy": proxy}
+
+    def _parse_batch(self):
+        raw = self.batch_text.get("1.0", "end")
+        out = []
+        for line in raw.splitlines():
+            parsed = self._parse_line(line)
+            if parsed:
+                out.append(parsed)
+        return out
+
+    # --- переключение режима ---
+
+    def _switch_mode(self):
+        if self._mode.get() == "batch":
+            self.nb.select(1)
+            self.run_btn.config(text="🤖 Запустить очередь")
+            self._update_batch_count()
+        else:
+            self.nb.select(0)
+            self.run_btn.config(text="🤖 Запустить")
+
+    # --- OK / отмена ---
+
+    def _resolve_proxy(self, line_proxy=None):
+        """Общий резолв прокси: приоритет у строки пакета, иначе радио."""
+        if line_proxy:
+            return line_proxy
+        proxy = self.proxy.get()
+        if proxy == "custom":
+            proxy = self.proxy_custom.get().strip()
+            if not proxy:
+                return None
+            return proxy
+        return "direct://"
+
+    def _ok(self):
+        if self._mode.get() == "batch":
+            items = self._parse_batch()
+            if not items:
+                messagebox.showwarning("Пакет",
+                                       "Не распознано ни одной пары email:password.",
+                                       parent=self)
+                return
+            # валидация прокси для режима custom
+            if self.proxy.get() == "custom" and not self.proxy_custom.get().strip():
+                messagebox.showwarning("Прокси", "Введите URL прокси.", parent=self)
+                return
+            self.result = {"mode": "batch", "items": items}
+            self.destroy()
+            return
+
+        # одиночный режим
+        email = self.email.get().strip()
+        if "@" not in email:
+            messagebox.showwarning("Email", "Введите корректный email.", parent=self)
+            return
+        if not self.mail_password.get().strip():
+            messagebox.showwarning("Пароль почты",
+                                   "Укажите пароль от почты (IMAP).", parent=self)
+            return
+        proxy = self._resolve_proxy()
+        if proxy is None:
+            messagebox.showwarning("Прокси", "Введите URL прокси.", parent=self)
+            return
+        self.result = {
+            "mode": "single",
+            "email": email,
+            "mail_password": self.mail_password.get().strip(),
+            "name": self.name.get().strip(),
+            "proxy": proxy,
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 if __name__ == "__main__":
