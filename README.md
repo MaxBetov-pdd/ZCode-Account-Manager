@@ -46,7 +46,7 @@ GUI-менеджер аккаунтов для [ZCode](https://z.ai) (прова
 ## Установка
 
 ```bash
-git clone https://github.com/<ваш-пользователь>/zcode-account-manager.git
+git clone https://github.com/MaxBetov-pdd/zcode-account-manager.git
 cd zcode-account-manager
 
 # Python-зависимости менеджера
