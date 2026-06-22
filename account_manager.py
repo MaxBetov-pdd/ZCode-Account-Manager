@@ -21,6 +21,7 @@ GUI-менеджер аккаунтов для ZCode (start-plan, OAuth Z.ai).
 import json
 import os
 import sys
+import re
 import shutil
 import base64
 import subprocess
@@ -30,6 +31,7 @@ import logging
 import traceback
 import datetime
 import threading
+import urllib.parse
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
@@ -55,6 +57,12 @@ try:
     import zcode_encrypt as ze
 except Exception:
     ze = None
+
+# requests — для проверки прокси (опционально)
+try:
+    import requests as _requests_mod
+except Exception:
+    _requests_mod = None
 
 # --- логирование в файл (видно даже под pythonw) ------------------------
 _log_path = Path(__file__).resolve().parent / "data" / "app.log"
@@ -1084,10 +1092,13 @@ class App(tk.Tk):
                     email = it["email"]
                     mail_password = it.get("mail_password")
                     name = it.get("name") or email.split("@")[0]
-                    # прокси из строки пакета имеет приоритет над общим
+                    # прокси: из item (распределён), иначе общий
                     line_proxy = it.get("proxy") or proxy
+                    proxy_tag = ("direct" if line_proxy in ("direct://", "direct", "")
+                                 else AutoregDialog._mask_proxy(line_proxy))
                     self._post_progress(
-                        f"──── [{i}/{total}] {email} ────", "info")
+                        f"──── [{i}/{total}] {email}  (прокси: {proxy_tag}) ────",
+                        "info")
                     try:
                         success = self._run_one_autoreg(
                             client, email, mail_password, line_proxy, name)
@@ -1434,8 +1445,11 @@ class AutoregDialog(tk.Toplevel):
                         command=self._switch_mode).pack(side="left")
 
         # --- Notebook: контейнер для двух форм ---
+        # ВАЖНО: Notebook без expand — иначе он вытесняет кнопки за пределы окна
+        # на вкладке Пакет (там много контента). Notebook занимает нужную высоту,
+        # а кнопки всегда видны внизу.
         self.nb = ttk.Notebook(frm)
-        self.nb.pack(fill="both", expand=True)
+        self.nb.pack(fill="x", expand=False)
 
         # вкладка: один аккаунт
         self.single_frm = ttk.Frame(self.nb, padding=6)
@@ -1447,29 +1461,16 @@ class AutoregDialog(tk.Toplevel):
         self.nb.add(self.batch_frm, text="Пакет")
         self._build_batch(self.batch_frm)
 
-        # --- общие: прокси ---
-        pf = ttk.LabelFrame(frm, text="Прокси", padding=8)
-        pf.pack(fill="x", pady=(8, 4))
-        self.proxy = tk.StringVar(value="direct://")
-        ttk.Radiobutton(pf, text="Без прокси (direct — с вашего IP)",
-                        value="direct://", variable=self.proxy).pack(anchor="w")
-        cust = ttk.Frame(pf)
-        cust.pack(fill="x", pady=(2, 0))
-        ttk.Radiobutton(cust, text="Свой:", value="custom",
-                        variable=self.proxy).pack(side="left")
-        self.proxy_custom = ttk.Entry(cust, width=40)
-        self.proxy_custom.pack(side="left", padx=(4, 0))
-
-        # пояснение про WAF
+        # --- пояснение про WAF ---
         ttk.Label(frm,
                   text="⚠ Без residential-прокси Z.AI может заблокировать "
                        "регистрацию (WAF 405). Капча и OAuth — вероятностны.",
-                  foreground="#a60", wraplength=520, justify="left").pack(
+                  foreground="#a60", wraplength=560, justify="left").pack(
             anchor="w", pady=(6, 2))
 
-        # --- кнопки ---
+        # --- кнопки (всегда видны внизу) ---
         btns = ttk.Frame(frm)
-        btns.pack(fill="x", pady=(10, 0))
+        btns.pack(side="bottom", fill="x", pady=(8, 0))
         ttk.Button(btns, text="Отмена", command=self._cancel).pack(side="left", padx=6)
         self.run_btn = ttk.Button(btns, text="🤖 Запустить", command=self._ok)
         self.run_btn.pack(side="left", padx=6)
@@ -1477,7 +1478,13 @@ class AutoregDialog(tk.Toplevel):
         self.transient(parent)
         self.attributes("-topmost", True)
         self.after(10, lambda: self.attributes("-topmost", False))
-        self.geometry(f"560x520+{parent.winfo_rootx() + 60}+{parent.winfo_rooty() + 40}")
+        # Геометрия: окно достаточно высокое для вкладки Пакет (поле аккаунтов
+        # + блок прокси + кнопка проверки + статус + кнопки действий).
+        # Позиция — левый верхний угол родителя, чтобы не уйти за экран.
+        gx = max(20, parent.winfo_rootx() + 40)
+        gy = max(10, parent.winfo_rooty() + 20)
+        self.geometry(f"640x780+{gx}+{gy}")
+        self.minsize(640, 600)
         self.focus_force()
         self.email_entry.focus_set()
         self.bind("<Escape>", lambda e: self._cancel())
@@ -1511,21 +1518,183 @@ class AutoregDialog(tk.Toplevel):
 
     def _build_batch(self, frm):
         ttk.Label(frm,
-                  text="По одной паре на строку. Пароль = пароль от почты (IMAP)."
-                       "\nПароль Z.AI сгенерируется автоматически.\n"
-                   "Поддерживается: email:password  |  email:password|proxy_url",
-                  foreground="gray", justify="left").pack(anchor="w", pady=(0, 4))
-        self.batch_text = tk.Text(frm, width=62, height=14,
+                  text="Аккаунты (по строкам). Пароль = пароль от почты (IMAP).\n"
+                       "Пароль Z.AI сгенерируется автоматически. Формат: email:password",
+                  foreground="gray", justify="left").pack(anchor="w", pady=(0, 2))
+        self.batch_text = tk.Text(frm, width=62, height=8,
                                   font=("Consolas", 9), wrap="none")
-        self.batch_text.pack(fill="both", expand=True)
-        self.batch_count_lbl = ttk.Label(frm, text="распознано: 0", foreground="gray")
-        self.batch_count_lbl.pack(anchor="w", pady=(4, 0))
+        self.batch_text.pack(fill="x", pady=(0, 2))
+        self.batch_count_lbl = ttk.Label(frm, text="аккаунтов: 0", foreground="gray")
+        self.batch_count_lbl.pack(anchor="w")
         self.batch_text.bind("<KeyRelease>", self._update_batch_count)
+
+        # --- блок прокси ---
+        pf = ttk.LabelFrame(frm, text="Прокси (опционально)", padding=6)
+        pf.pack(fill="x", pady=(8, 0))
+        ttk.Label(pf,
+                  text="По строкам. Формат: proxy:N  (N = сколько аккаунтов через него).\n"
+                       "host:port  ·  user:pass@host:port  ·  http://host:port  ·  "
+                       "user:pass@host:port:3\n"
+                       "Если аккаунтов больше, чем мест на прокси — остаток пойдёт напрямую.",
+                  foreground="gray", justify="left").pack(anchor="w", pady=(0, 2))
+        self.proxy_text = tk.Text(pf, width=62, height=4,
+                                  font=("Consolas", 9), wrap="none")
+        self.proxy_text.pack(fill="x")
+        self.proxy_text.bind("<KeyRelease>", self._update_proxy_count)
+        pbtns = ttk.Frame(pf)
+        pbtns.pack(fill="x", pady=(4, 0))
+        ttk.Button(pbtns, text="🔍 Проверить прокси",
+                   command=self._check_proxies_clicked).pack(side="left")
+        self.proxy_count_lbl = ttk.Label(pbtns, text="мест: 0", foreground="gray")
+        self.proxy_count_lbl.pack(side="left", padx=(10, 0))
+        self.proxy_check_status = tk.Text(pf, height=3, wrap="word", relief="flat",
+                                          font=("Segoe UI", 9))
+        self.proxy_check_status.pack(fill="x", pady=(4, 0))
+        self.proxy_check_status.configure(state="disabled")
 
     def _update_batch_count(self, _evt=None):
         items = self._parse_batch()
+        n_accounts = len(items)
+        n_slots = self._total_proxy_slots()
+        extra = max(0, n_accounts - n_slots)
+        extra_txt = f" (+{extra} без прокси)" if extra > 0 else ""
         self.batch_count_lbl.config(
-            text=f"распознано: {len(items)} аккаунт(ов)")
+            text=f"аккаунтов: {n_accounts}  ·  мест на прокси: {n_slots}{extra_txt}")
+
+    # --- парсинг прокси ---
+
+    @staticmethod
+    def _normalize_proxy_url(raw):
+        """Приводит прокси к виду http://[user:pass@]host:port.
+        Возвращает (url, error). url=None при ошибке."""
+        s = raw.strip()
+        if not s:
+            return None, "пусто"
+        # уже с схемой
+        if s.lower().startswith("http://") or s.lower().startswith("https://"):
+            try:
+                u = urllib.parse.urlparse(s)
+                if not u.hostname or not u.port:
+                    return None, "нет host:port"
+                return s, None
+            except Exception as e:
+                return None, str(e)
+        # socks5 не поддерживается (undici ProxyAgent)
+        if s.lower().startswith("socks"):
+            return None, "socks не поддерживается (только http/https)"
+        # user:pass@host:port
+        m = re.match(r"^([^:@]+):([^@]+)@([^:]+):(\d+)$", s)
+        if m:
+            return f"http://{m.group(1)}:{m.group(2)}@{m.group(3)}:{m.group(4)}", None
+        # host:port:user:pass  (4 части через :)
+        parts = s.split(":")
+        if len(parts) == 4 and parts[3].isdigit() is False and parts[1].isdigit():
+            # host:port:user:pass — host:port первые два
+            host, port = parts[0], parts[1]
+            user, pwd = parts[2], parts[3]
+            return f"http://{user}:{pwd}@{host}:{port}", None
+        # host:port
+        if len(parts) == 2 and parts[1].isdigit():
+            return f"http://{parts[0]}:{parts[1]}", None
+        return None, "не распознано"
+
+    def _parse_proxies(self):
+        """Парсит поле прокси: каждая строка 'proxy' или 'proxy:N'.
+        Возвращает [(url, n_slots), ...]."""
+        raw = self.proxy_text.get("1.0", "end")
+        out = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            # отделяем :N в конце (N — число аккаунтов)
+            n = 1
+            m = re.match(r"^(.+):(\d+)$", s)
+            if m:
+                proxy_part = m.group(1).strip()
+                n = int(m.group(2))
+                if n < 1:
+                    n = 1
+            else:
+                proxy_part = s
+            url, err = self._normalize_proxy_url(proxy_part)
+            if url:
+                out.append((url, n))
+        return out
+
+    def _total_proxy_slots(self):
+        return sum(n for _, n in self._parse_proxies())
+
+    def _update_proxy_count(self, _evt=None):
+        self._update_batch_count()
+
+    # --- проверка прокси ---
+
+    def _check_proxies_clicked(self):
+        """Запускает проверку прокси в фоне, показывает статус."""
+        proxies = self._parse_proxies()
+        if not proxies:
+            self._set_proxy_check_status("Нет прокси для проверки.", "gray")
+            return
+        self._set_proxy_check_status("Проверяю прокси…", "gray")
+        self._checking = True
+
+        def worker():
+            lines = []
+            for url, n in proxies:
+                ok, ip, err = self._check_one_proxy(url)
+                if ok:
+                    lines.append(f"✓ {self._mask_proxy(url)} → IP {ip} (×{n})")
+                else:
+                    lines.append(f"✗ {self._mask_proxy(url)} → {err}")
+            self.after(0, lambda: self._on_proxy_check_done(lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _mask_proxy(url):
+        try:
+            u = urllib.parse.urlparse(url)
+            host = u.hostname or "?"
+            port = u.port or "?"
+            if u.username:
+                return f"{u.username}:***@{host}:{port}"
+            return f"{host}:{port}"
+        except Exception:
+            return url[:20] + "..."
+
+    @staticmethod
+    def _check_one_proxy(url):
+        """Проверяет прокси запросом к ipify. Возвращает (ok, ip, error)."""
+        if _requests_mod is None:
+            return False, None, "модуль requests не установлен"
+        try:
+            r = _requests_mod.get("https://api.ipify.org?format=json",
+                                  proxies={"http": url, "https": url}, timeout=12)
+            if r.status_code == 200:
+                ip = r.json().get("ip", "?")
+                return True, ip, None
+            return False, None, f"HTTP {r.status_code}"
+        except Exception as e:
+            return False, None, str(e)[:60]
+
+    def _on_proxy_check_done(self, lines):
+        self._checking = False
+        all_ok = all(l.startswith("✓") for l in lines)
+        color = "#0a7" if all_ok else "#c33"
+        self._set_proxy_check_status("\n".join(lines), color)
+
+    def _set_proxy_check_status(self, text, color):
+        w = self.proxy_check_status
+        w.configure(state="normal")
+        w.delete("1.0", "end")
+        w.insert("1.0", text)
+        try:
+            w.tag_add("c", "1.0", "end")
+            w.tag_config("c", foreground=color)
+        except Exception:
+            pass
+        w.configure(state="disabled")
 
     @staticmethod
     def _parse_line(line):
@@ -1581,6 +1750,26 @@ class AutoregDialog(tk.Toplevel):
             return proxy
         return "direct://"
 
+    def _assign_proxies_to_items(self, items, proxies):
+        """Распределяет аккаунты по прокси.
+        proxies = [(url, n_slots), ...]. Если мест меньше, чем аккаунтов —
+        остаток идёт напрямую (proxy='direct://'). Возвращает items с проставленным proxy.
+        """
+        if not proxies:
+            for it in items:
+                it["proxy"] = "direct://"
+            return items
+        # строим очередь слотов: каждый прокси повторяется n_slots раз
+        slot_pool = []
+        for url, n in proxies:
+            slot_pool.extend([url] * n)
+        for i, it in enumerate(items):
+            if i < len(slot_pool):
+                it["proxy"] = slot_pool[i]
+            else:
+                it["proxy"] = "direct://"
+        return items
+
     def _ok(self):
         if self._mode.get() == "batch":
             items = self._parse_batch()
@@ -1589,9 +1778,28 @@ class AutoregDialog(tk.Toplevel):
                                        "Не распознано ни одной пары email:password.",
                                        parent=self)
                 return
-            # валидация прокси для режима custom
-            if self.proxy.get() == "custom" and not self.proxy_custom.get().strip():
-                messagebox.showwarning("Прокси", "Введите URL прокси.", parent=self)
+            # парсим прокси + проверяем валидность формата
+            proxies = self._parse_proxies()
+            bad = []
+            normalized_proxies = []
+            for url, n in proxies:
+                norm, err = self._normalize_proxy_url(
+                    url.split("://", 1)[1] if "://" in url else url)
+                if norm:
+                    normalized_proxies.append((norm, n))
+                else:
+                    bad.append(f"{self._mask_proxy(url)}: {err}")
+            if bad:
+                messagebox.showwarning("Прокси",
+                                       "Невалидные прокси:\n" + "\n".join(bad),
+                                       parent=self)
+                return
+            # распределяем аккаунты по прокси
+            items = self._assign_proxies_to_items(items, normalized_proxies)
+            n_direct = sum(1 for it in items if it["proxy"] == "direct://")
+            summary = (f"Запустить очередь: {len(items)} аккаунтов?\n"
+                       f"Через прокси: {len(items) - n_direct}, напрямую: {n_direct}")
+            if not messagebox.askyesno("Подтверждение очереди", summary, parent=self):
                 return
             self.result = {"mode": "batch", "items": items}
             self.destroy()
